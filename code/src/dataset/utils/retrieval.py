@@ -17,6 +17,10 @@ def retrieval_via_pcst_2(
     cost_e=0.5,
     alpha=0.5,
 ):
+    # Alpha interpolation used in this project:
+    # alpha = 0.0 -> original-question focus
+    # alpha = 1.0 -> subquestion focus
+
     # Backward compatibility with old call style:
     # retrieval_via_pcst_2(graph, q_emb, textual_nodes, textual_edges, ...)
     if textual_edges is None and textual_nodes is not None and not torch.is_tensor(sq_emb):
@@ -48,7 +52,7 @@ def retrieval_via_pcst_2(
     if topk > 0:
         n_prizes = torch.nn.CosineSimilarity(dim=-1)(q_emb, graph.x)
         n_prizes_sub = torch.nn.CosineSimilarity(dim=-1)(sq_emb, graph.x)
-        n_prizes_total = alpha*n_prizes + (1-alpha)*n_prizes_sub
+        n_prizes_total = (1 - alpha) * n_prizes + alpha * n_prizes_sub
         topk = min(topk, graph.num_nodes)
         _, topk_n_indices = torch.topk(n_prizes_total, topk, largest=True)
 
@@ -60,7 +64,7 @@ def retrieval_via_pcst_2(
     if topk_e > 0:
         e_prizes = torch.nn.CosineSimilarity(dim=-1)(q_emb, graph.edge_attr)
         e_prizes_sub = torch.nn.CosineSimilarity(dim=-1)(sq_emb, graph.edge_attr)
-        e_prizes_total = (alpha*e_prizes + (1-alpha)*e_prizes_sub)/2
+        e_prizes_total = ((1 - alpha) * e_prizes + alpha * e_prizes_sub) / 2
         topk_e = min(topk_e, e_prizes_total.unique().size(0))
 
         topk_e_values, _ = torch.topk(e_prizes_total.unique(), topk_e, largest=True)

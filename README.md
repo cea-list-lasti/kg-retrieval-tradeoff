@@ -179,7 +179,7 @@ Optional:
 | Pipeline | `checkpoint_path` | `""` |
 | Pipeline | `decomp_dataset_glob` | `""` (auto-resolved) |
 | Pipeline | `decomp_run_name` | `"default"` |
-| Pipeline | `alpha` | `0.5` |
+| Pipeline | `alpha` | `0.5` (`0`: original-question focus, `1`: subquestion focus) |
 
 ### Internal Defaults Used In Code
 
@@ -199,3 +199,4 @@ Optional:
 
 - CWQ split generation keeps the paper setting of evaluating the first 1000 test samples.
 - If you use a different LLM backbone, adjust projector output size in `src/model/graph_llm.py`.
+- In retrieval, `alpha=0` uses only the original-question signal, while `alpha=1` uses only the subquestion signal.

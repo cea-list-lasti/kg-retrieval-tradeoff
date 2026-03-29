@@ -142,6 +142,59 @@ Optional:
 - pass `--checkpoint_path /abs/path/to/checkpoint.pth` to force a specific checkpoint
 - pass `--decomp_dataset_glob "/abs/path/dataset_chunk_*.parquet"` to override decomposition dataset input
 
+## Default Parameters And Hyperparameters
+
+### CLI Defaults (`src/config.py`)
+
+| Group | Parameter | Default |
+|---|---|---|
+| General | `model_name` | `graph_llm` |
+| General | `dataset` | `cwq` |
+| Training | `lr` | `1e-5` |
+| Training | `wd` | `0.05` |
+| Training | `patience` | `2` |
+| Training | `batch_size` | `2` |
+| Training | `grad_steps` | `2` |
+| Training | `num_workers` | `min(8, os.cpu_count() or 1)` |
+| Training | `num_epochs` | `10` |
+| Training | `warmup_epochs` | `1` |
+| Eval | `eval_batch_size` | `16` |
+| LLM | `llm_model_name` | `7b` |
+| LLM | `llm_model_path` | `""` (auto-resolved from model map) |
+| LLM | `llm_frozen` | `True` |
+| LLM | `llm_num_virtual_tokens` | `10` |
+| LLM | `max_txt_len` | `512` |
+| LLM | `max_new_tokens` | `32` |
+| LLM | `max_memory` | `[80, 80]` (GiB per GPU index) |
+| GNN | `gnn_model_name` | `gt` |
+| GNN | `gnn_num_layers` | `4` |
+| GNN | `gnn_in_dim` | `1024` |
+| GNN | `gnn_hidden_dim` | `1024` |
+| GNN | `gnn_num_heads` | `4` |
+| GNN | `gnn_dropout` | `0.0` |
+| Paths | `datasets_dir` | `${DATASETS_DIR}` |
+| Paths | `decomp_datasets_dir` | `${DECOMP_DATASETS_DIR}` |
+| Paths | `preprocessed_dir` | `${PREPROCESSED_DIR}` |
+| Paths | `output_dir` | `${OUTPUT_DIR}` |
+| Pipeline | `checkpoint_path` | `""` |
+| Pipeline | `decomp_dataset_glob` | `""` (auto-resolved) |
+| Pipeline | `decomp_run_name` | `"default"` |
+| Pipeline | `alpha` | `0.5` |
+
+### Internal Defaults Used In Code
+
+| Component | Parameter | Default |
+|---|---|---|
+| Retrieval (`retrieval_via_pcst_2`) | `topk` | `3` |
+| Retrieval (`retrieval_via_pcst_2`) | `topk_e` | `5` |
+| Retrieval (`retrieval_via_pcst_2`) | `cost_e` | `0.5` |
+| Retrieval (`retrieval_via_pcst_2`) | `alpha` | `0.5` |
+| CWQ cache preprocessing | `topk`, `topk_e`, `cost_e` | `5`, `7`, `0.5` |
+| WebQSP cache preprocessing | `topk`, `topk_e`, `cost_e` | `3`, `5`, `0.5` |
+| LoRA (when `llm_frozen=False`) | `r`, `alpha`, `dropout` | `8`, `16`, `0.05` |
+| LR schedule | `min_lr` | `5e-6` |
+| Generation (`inference`) | `do_sample`, `temperature`, `top_p` | `False`, `1`, `1` (GraphLLM path) |
+
 ## Notes
 
 - CWQ split generation keeps the paper setting of evaluating the first 1000 test samples.

@@ -2,7 +2,7 @@ from src.model.llm import LLM
 from src.model.pt_llm import PromptTuningLLM
 from src.model.graph_llm import GraphLLM
 
-from config import LLM_MODELS_PATH
+from src.config import LLM_MODELS_PATH
 
 load_model = {
     "llm": LLM,

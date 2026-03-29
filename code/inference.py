@@ -3,7 +3,6 @@ import torch
 import gc
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-import json
 import pandas as pd
 
 from src.config import parse_args_llama
@@ -11,9 +10,11 @@ from src.model import load_model, llama_model_path
 from src.dataset import load_dataset
 from src.utils.evaluate import eval_funcs
 from src.utils.collate import collate_fn
+from src.utils.ckpt import _reload_best_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.cuda.set_device(0)
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
 
 
 def inference(args):
@@ -28,8 +29,10 @@ def inference(args):
     test_loader = DataLoader(test_dataset, batch_size=args.eval_batch_size, drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn)
 
     # Step 3: Build Model
-    args.llm_model_path = llama_model_path[args.llm_model_name]
+    if not args.llm_model_path:
+        args.llm_model_path = llama_model_path[args.llm_model_name]
     model = load_model[args.model_name](graph=dataset.graph, graph_type=dataset.graph_type, args=args)
+    model = _reload_best_model(model, args)
 
     # Step 4. Evaluation
     os.makedirs(f'{args.output_dir}/{args.dataset}', exist_ok=True)
@@ -38,14 +41,20 @@ def inference(args):
 
     model.eval()
     progress_bar_test = tqdm(range(len(test_loader)))
-    with open(path, "w") as f:
-        for _, batch in enumerate(test_loader):
-            with torch.no_grad():
-                output = model.inference(batch)
-                df = pd.DataFrame(output)
-                for _, row in df.iterrows():
-                    f.write(json.dumps(dict(row)) + "\n")
-            progress_bar_test.update(1)
+    results = []
+    for _, batch in enumerate(test_loader):
+        with torch.no_grad():
+            output = model.inference(batch)
+            df = pd.DataFrame(output)
+            results.append(df)
+        progress_bar_test.update(1)
+
+    if len(results) > 0:
+        final_df = pd.concat(results, ignore_index=True)
+        final_df.to_csv(path, index=False)
+    else:
+        print("No predictions were produced. Skipping metric computation.")
+        return
 
     # Step 5. Compute Metrics
     acc = eval_funcs[args.dataset](path)
@@ -57,6 +66,8 @@ if __name__ == "__main__":
     args = parse_args_llama()
 
     inference(args)
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     gc.collect()

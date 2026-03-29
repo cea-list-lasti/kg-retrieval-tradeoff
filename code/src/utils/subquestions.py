@@ -2,25 +2,16 @@ from datasets import load_dataset
 from vllm import LLM, SamplingParams
 from vllm.sampling_params import GuidedDecodingParams
 from pydantic import BaseModel
-from src.config import parse_args_llama
+from src.config import parse_args_llama, resolve_hf_dataset
 from tqdm import tqdm
 import datasets
 import os
+from pathlib import Path
 import torch
 import gc
 import json
 import re
 import pandas as pd
-
-os.environ["HF_HUB_OFFLINE"] = "1" # use local datasets
-
-alpha = os.environ.get("ALPHA")
-if alpha == None:
-    print("Env variable not defined")
-
-args = parse_args_llama()
-
-path = f"/home/project/decomp_datasets/{args.dataset}"
 
 
 def build_prompt(question):
@@ -114,20 +105,21 @@ def save_as_multiple_parquet(path, df, chunk_size=10000):
     
     for i in range(num_chunks):
         chunk = df.iloc[i * chunk_size:(i + 1) * chunk_size]
-        chunk_file_path = f"{path}/dataset_chunk_{i}.parquet"
-        chunk.to_parquet(chunk_file_path, engine='pyarrow', index=False)
+        chunk_file_path = Path(path) / f"dataset_chunk_{i}.parquet"
+        chunk.to_parquet(str(chunk_file_path), engine='pyarrow', index=False)
         print(f"Saved chunk {i} to {chunk_file_path}")
 
 
 
 def generate(args):
+    output_path = Path(args.decomp_datasets_dir) / args.dataset
 
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
 
     #Load the CWQ dataset
     counter = 0
 
-    dataset = load_dataset(f"/home/project/datasets/RoG-{args.dataset}")
+    dataset = load_dataset(resolve_hf_dataset(args.dataset, args.datasets_dir))
     dataset = datasets.concatenate_datasets([dataset["train"], dataset["validation"], dataset["test"]])
 
 
@@ -135,7 +127,7 @@ def generate(args):
 
     #Load the model 
 
-    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+    MODEL_NAME = os.getenv("DECOMPOSER_MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")
     llm = LLM(
     model=MODEL_NAME,
     tensor_parallel_size=1,
@@ -176,15 +168,18 @@ def generate(args):
     # Convert to Pandas DataFrame
     df = pd.DataFrame(subquestions_dataset)
 
-    save_as_multiple_parquet(path, df, chunk_size=2000)  # adjust chunk_size as needed
+    save_as_multiple_parquet(output_path, df, chunk_size=2000)  # adjust chunk_size as needed
 
     print("Success!")
 
 
 if __name__ == "__main__":
+    cli_args = parse_args_llama()
 
-    generate()
+    generate(cli_args)
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_max_memory_allocated()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_max_memory_allocated()
     gc.collect()

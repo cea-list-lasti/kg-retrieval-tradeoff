@@ -1,212 +1,241 @@
+import gc
 import logging
 import os
+from pathlib import Path
+
 import pandas as pd
 import torch
-import gc
+from torch.utils.data import Subset
 from tqdm import tqdm
 
-from src.utils.lm_modeling import load_text2embedding
-from src.utils.load import load_parquet
-from src.utils.lm_modeling import load_model as lm
-from src.dataset.utils.retrieval import retrieval_via_pcst_2, concatenate_subgraphs_2
-from src.model import load_model, llama_model_path
 from src.config import parse_args_llama
-from torch.utils.data import Subset
+from src.dataset.utils.retrieval import concatenate_subgraphs_2, retrieval_via_pcst_2
+from src.model import llama_model_path, load_model
+from src.utils.ckpt import _reload_best_model, _reload_model
 from src.utils.evaluate import eval_funcs
-from src.utils.ckpt import _reload_model
-from src.utils.load import get_indices
+from src.utils.lm_modeling import load_model as lm
+from src.utils.lm_modeling import load_text2embedding
+from src.utils.load import get_indices, load_parquet
 
-from config import DATASET_BASE_PATH, PROJECT_ROOT, LLM_MODELS_PATH
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
-# Set the desired alpha value in the launch script
-
-alpha = os.environ.get("ALPHA")
-if alpha == None:
-    logger.warning("Env variable not defined")
+model_name = "sbert"
 
 
-args = parse_args_llama()
+def final_prompt(question, subqa_pairs):
+    context = ""
+    for pair in subqa_pairs:
+        context += f"{pair['question']}{pair['answer']}\n"
+    return (
+        "Use the given graph and question/answer pairs to answer the following question.\n"
+        f"Question/answer pairs:\n{context}"
+        f"Question: {question}\n"
+        "Answer:"
+    )
 
 
-model_name = 'sbert'
-# path = f'/home/project/preprocessed/{args.dataset}'
-path = str(DATASET_BASE_PATH / 'cwq')
-# alpha_path = f'{path}/decomp_reasoning/{alpha}'
-alpha_path = str(DATASET_BASE_PATH / 'subquestions/cond_option_1')
-dataset_path = str(DATASET_BASE_PATH)  + "/cwq_reason/subquestions/2/dataset_chunk_*.parquet"
-output_path = f'{args.output_dir}/{args.dataset}/{alpha}'
-path_nodes = f'{path}/nodes'
-path_edges = f'{path}/edges'
-path_graphs = f'{path}/graphs'
-path_embs = f'{path}/embs'
-cached_graph_sub = f'{alpha_path}/cached_graphs_sub'
-cached_desc_sub = f'{alpha_path}/cached_desc_sub'
-cached_graph = f'{alpha_path}/cached_graphs'
-cached_desc = f'{alpha_path}/cached_desc'
+def build_paths(args):
+    preprocessed = Path(args.preprocessed_dir) / args.dataset
+    decomp_dataset_glob = args.decomp_dataset_glob or str(
+        Path(args.decomp_datasets_dir) / args.dataset / "dataset_chunk_*.parquet"
+    )
+    run_name = args.decomp_run_name or f"alpha_{str(args.alpha).replace('.', '_')}"
+    run_cache = preprocessed / "decomp_reasoning" / run_name
+    output_dir = Path(args.output_dir) / args.dataset / run_name
 
-logger.info(f"dataset_path: {dataset_path}")
-# Building the prompt for final answer generation
+    return {
+        "preprocessed": preprocessed,
+        "decomp_dataset_glob": decomp_dataset_glob,
+        "output_dir": output_dir,
+        "nodes": preprocessed / "nodes",
+        "edges": preprocessed / "edges",
+        "graphs": preprocessed / "graphs",
+        "q_embs": preprocessed / "q_embs.pt",
+        "split_indices": preprocessed / "split" / "test_indices.txt",
+        "cached_graph_sub": run_cache / "cached_graphs_sub",
+        "cached_desc_sub": run_cache / "cached_desc_sub",
+        "cached_graph": preprocessed / "cached_graphs",
+        "cached_desc": preprocessed / "cached_desc",
+    }
 
-def final_prompt(question, subs):
-    s = ""
-    for sub in subs:
-        sub_q = sub["question"]
-        sub_a = sub["answer"]
-        s += sub_q + sub_a + '\n'
-    return ("Use the given graph and question/answer pairs to answer the following question. \nQuestion:" + question + "\n Answer:")
-
-
-
-# Pipeline for generation
 
 def pipeline(args):
+    paths = build_paths(args)
 
-    # Creating Directories + Loading Dataset
-    os.makedirs(path, exist_ok=True)
-    os.makedirs(cached_graph, exist_ok=True)
-    os.makedirs(cached_desc, exist_ok=True)
-    os.makedirs(cached_graph_sub, exist_ok=True)
-    os.makedirs(cached_desc_sub, exist_ok=True)
-    os.makedirs(output_path, exist_ok=True)
-    torch.cuda.empty_cache()
-    logger.info("Cleared Memory Cache")
-    logger.info('Loading dataset...')
-    dataset = load_parquet(dataset_path)
-    test_indices = get_indices(f"{path}/split/test_indices.txt")
-    dataset = Subset(dataset, test_indices)
-    logger.info(f"Size of the fed up dataset: {len(dataset)}")
+    os.makedirs(paths["cached_graph"], exist_ok=True)
+    os.makedirs(paths["cached_desc"], exist_ok=True)
+    os.makedirs(paths["cached_graph_sub"], exist_ok=True)
+    os.makedirs(paths["cached_desc_sub"], exist_ok=True)
+    os.makedirs(paths["output_dir"], exist_ok=True)
 
-    # Loading Encoder
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("Loading dataset from %s", paths["decomp_dataset_glob"])
+    dataset = load_parquet(paths["decomp_dataset_glob"])
+    if paths["split_indices"].exists():
+        test_indices = get_indices(paths["split_indices"])
+    else:
+        logger.warning("Missing test split file at %s. Using sequential indices.", paths["split_indices"])
+        test_indices = []
+
+    if len(test_indices) > 0 and max(test_indices) < len(dataset):
+        dataset = Subset(dataset, test_indices)
+        dataset_indices = test_indices
+    else:
+        logger.warning(
+            "Test indices do not fit loaded decomposition dataset; using sequential dataset indices."
+        )
+        dataset_indices = list(range(len(dataset)))
+    logger.info("Pipeline input size: %s", len(dataset))
+
     model_emb, tokenizer, device = lm[model_name]()
     text2embedding = load_text2embedding[model_name]
 
-    # Loading LLM for subquestions
     if not args.llm_model_path:
         args.llm_model_path = llama_model_path[args.llm_model_name]
-    model = load_model[args.model_name](args=args, init_prompt = "Your role is to answer a question using a graph.")
-    if args.llm_model_name == "13b" or args.llm_model_name == "13b_chat":
-        checkpoint = "model_name_graph_llm_llm_model_name_13b_llm_frozen_True_max_txt_len_512_max_new_tokens_32_gnn_model_name_gt_patience_2_num_epochs_10_checkpoint_best.pth"
-    if args.llm_model_name == "7b" or args.llm_model_name == "7b_chat":
-        # checkpoint = "model_name_graph_llm_llm_model_name_7b_llm_frozen_True_max_txt_len_512_max_new_tokens_32_gnn_model_name_gt_patience_2_num_epochs_10_checkpoint_best.pth"
-        checkpoint = "model_name_graph_llm_llm_model_name_7b_llm_frozen_True_max_txt_len_512_max_new_tokens_32_gnn_model_name_gt_patience_2_num_epochs_10_seed0_checkpoint_best.pth"
-    model = _reload_model(model, f"{args.output_dir}/{args.dataset}/{checkpoint}")
+
+    model = load_model[args.model_name](
+        args=args,
+        init_prompt="Your role is to answer a question using a graph.",
+    )
+
+    if args.checkpoint_path:
+        model = _reload_model(model, args.checkpoint_path)
+    else:
+        model = _reload_best_model(model, args)
     model.eval()
 
-    # Uncomment following lines for using different LLM for final question generation
+    save_path = paths["output_dir"] / (
+        f"model_name_{args.model_name}_llm_model_name_{args.llm_model_name}_"
+        f"llm_frozen_{args.llm_frozen}_max_txt_len_{args.max_txt_len}_"
+        f"max_new_tokens_{args.max_new_tokens}_gnn_model_name_{args.gnn_model_name}_"
+        f"patience_{args.patience}_num_epochs_{args.num_epochs}_alpha_{args.alpha}.csv"
+    )
+    logger.info("Saving predictions to %s", save_path)
 
-    # model = load_model[args.model_name](args=args, init_prompt = "From the given elements, answer the following question.")
-    # checkpoint_sub = "model_name_graph_llm_llm_model_name_7b_llm_frozen_True_max_txt_len_512_max_new_tokens_32_gnn_model_name_gt_patience_2_num_epochs_10_checkpoint_best.pth"
-    # model_2 = _reload_model(model, f"{args.output_dir}/cwq_sub/{checkpoint_sub}") # set manually to choose wanted model
-    # model_2.eval()
-
-    # Pipeline
-    save_path = f'{output_path}/model_name_{args.model_name}_llm_model_name_{args.llm_model_name}_llm_frozen_{args.llm_frozen}_max_txt_len_{args.max_txt_len}_max_new_tokens_{args.max_new_tokens}_gnn_model_name_{args.gnn_model_name}_patience_{args.patience}_num_epochs_{args.num_epochs}_alpha{alpha}_test_first1000.csv'
-    logger.info(f'save_path: {save_path}')
-    first = test_indices[0]
-    q_embs = torch.load(f'{path}/q_embs.pt')
+    q_embs = torch.load(paths["q_embs"])
     all_results = []
-
-    # Iterate over questions
     missing_parts = 0
+
     for ind, line in enumerate(tqdm(dataset)):
-        index = ind + first # if you generated subquestions for entire dataset
-        index = ind # if you only generated subquestions for the test set
-        subanswer_list = []
-        q_emb = q_embs[index]
-        nodes = pd.read_csv(f'{path_nodes}/{index}.csv')
-        edges = pd.read_csv(f'{path_edges}/{index}.csv')
-        try:
-            graph = torch.load(f'{path_graphs}/{index}.pt')
-        except FileNotFoundError as e:
-            logger.warning(f"Dataset file missing. Skipping part: {index}")
+        index = dataset_indices[ind]
+        nodes_path = paths["nodes"] / f"{index}.csv"
+        edges_path = paths["edges"] / f"{index}.csv"
+        graph_path = paths["graphs"] / f"{index}.pt"
+
+        if not nodes_path.exists() or not edges_path.exists() or not graph_path.exists():
+            logger.warning("Missing preprocessed files for index %s. Skipping.", index)
             missing_parts += 1
             continue
 
+        subanswer_list = []
+        q_emb = q_embs[index]
+        nodes = pd.read_csv(nodes_path)
+        edges = pd.read_csv(edges_path)
+        graph = torch.load(graph_path)
+
+        subquestions = line.get("subquestions", [])
+        if len(subquestions) == 0:
+            subquestions = [line["question"]]
+
+        subgraphs = []
         answer = None
-        subquestions = line["subquestions"]
-        os.makedirs(f"{cached_graph_sub}/{index}", exist_ok=True)
-        os.makedirs(f"{cached_desc_sub}/{index}", exist_ok=True)
+        question_cache_dir = paths["cached_graph_sub"] / str(index)
+        desc_cache_dir = paths["cached_desc_sub"] / str(index)
+        os.makedirs(question_cache_dir, exist_ok=True)
+        os.makedirs(desc_cache_dir, exist_ok=True)
 
-        # Iterate over subquestions
-        for j,subquestion in enumerate(subquestions):
-            if not answer :
-                text = subquestion
-            else:
-                text = answer["pred"][0] + subquestion
+        for j, subquestion in enumerate(subquestions):
+            text = subquestion if answer is None else answer["pred"][0] + subquestion
 
-            # For each subquestion: performing retrieval, generating answer, conditionning the next subquestion 
             sq_emb = text2embedding(model_emb, tokenizer, device, text)
-            subg, desc = retrieval_via_pcst_2(graph, q_emb, sq_emb, nodes, edges, topk=3, topk_e=5, cost_e=0.5, alpha=float(alpha))
-            torch.save(subg, f'{cached_graph_sub}/{index}/{j}.pt') 
-            open(f'{cached_desc_sub}/{index}/{j}.txt', 'w').write(desc) 
-            sample = {"id": line["id"], "label": line["a_entity"],"subquestion":text, "desc": desc, "graph": subg}
+            subg, desc = retrieval_via_pcst_2(
+                graph,
+                q_emb,
+                sq_emb,
+                nodes,
+                edges,
+                topk=3,
+                topk_e=5,
+                cost_e=0.5,
+                alpha=float(args.alpha),
+            )
+
+            graph_cache_path = question_cache_dir / f"{j}.pt"
+            desc_cache_path = desc_cache_dir / f"{j}.txt"
+            torch.save(subg, graph_cache_path)
+            with open(desc_cache_path, "w") as fp:
+                fp.write(desc)
+            subgraphs.append((subg, str(desc_cache_path)))
+
+            sub_label = line.get("a_entity", line.get("answer", []))
+            if isinstance(sub_label, list):
+                sub_label = "|".join(sub_label).lower()
+            else:
+                sub_label = str(sub_label).lower()
+
+            sample = {
+                "id": line["id"],
+                "label": sub_label,
+                "subquestion": text,
+                "desc": desc,
+                "graph": subg,
+            }
             with torch.no_grad():
                 answer = model.inference_sub(sample)
-                subanswer_list.append({"question":subquestion, "answer": answer["pred"][0]})
+            subanswer_list.append({"question": subquestion, "answer": answer["pred"][0]})
 
-        # Merging graphs and textual descs
-        subgraphs = []
-        num_subquestions = len(subquestions)
-        if num_subquestions == 0:
-            logger.info(f"No subquestions at index {index}")
-            continue
-
-        for j in range(num_subquestions):
-            subgraph_path = f'{cached_graph_sub}/{index}/{j}.pt'
-            desc_path = f'{cached_desc_sub}/{index}/{j}.txt'
-            if not os.path.exists(subgraph_path) or not os.path.exists(desc_path):
-                logger.warning(f'Missing files for question {index}, subquestion {j}')
-                continue
-            subgraph = torch.load(subgraph_path)
-            subgraphs.append((subgraph, desc_path))
-
-
-        if len(subgraphs) == 0:
-            logger.info(f"No subgraphs to concatenate at index {index}")
-            continue
         try:
             merged_graph, merged_desc = concatenate_subgraphs_2(subgraphs)
-        except Exception as e:
-            logger.warning(f"Exception during subgraphs concatenation: {e}")
+        except Exception as exc:
+            logger.warning("Failed to concatenate subgraphs at index %s: %s", index, exc)
             continue
 
-        # Saving graphs
-        torch.save(merged_graph, f'{path}/cached_graphs/{index}.pt')
-        with open(f'{path}/cached_desc/{index}.txt', 'w') as k:
-            k.write(merged_desc)
+        torch.save(merged_graph, paths["cached_graph"] / f"{index}.pt")
+        with open(paths["cached_desc"] / f"{index}.txt", "w") as fp:
+            fp.write(merged_desc)
 
-        # Generate final answer
         question = final_prompt(line["question"], subanswer_list)
-        label = ('|').join(line['answer']).lower()
-        sample = sample = {"id": line["id"], "label": label,"subquestion":question, "desc": merged_desc, "graph": merged_graph }
+        label = "|".join(line["answer"]).lower()
+        final_sample = {
+            "id": line["id"],
+            "label": label,
+            "subquestion": question,
+            "desc": merged_desc,
+            "graph": merged_graph,
+        }
         with torch.no_grad():
-                answer = model.inference_sub(sample)
+            answer = model.inference_sub(final_sample)
 
-        df = pd.DataFrame(answer)
-        all_results.append(df)
+        all_results.append(pd.DataFrame(answer))
+
     if missing_parts > 0:
-        logger.info(f"There was {missing_parts} missing parts")
+        logger.info("Skipped %s entries due to missing files.", missing_parts)
+
+    if len(all_results) == 0:
+        logger.warning("No predictions were produced. Exiting without metrics.")
+        return
+
     final_df = pd.concat(all_results, ignore_index=True)
     final_df.to_csv(save_path, index=False)
+    logger.info("Done with pipeline.")
 
-    logger.info("Done with pipeline !")
-
-    # Model evaluation ; bad calls show the samples where the generated answer is incorrect
     acc, bad_calls = eval_funcs[args.dataset](save_path)
-
-    open(f'{output_path}/bad_calls.txt',"w").write(str(bad_calls))
-    open(f'{output_path}/metrics.txt',"w").write(str(acc))
-    logger.info(f'Test Acc {acc}')
+    with open(paths["output_dir"] / "bad_calls.txt", "w") as fp:
+        fp.write(str(bad_calls))
+    with open(paths["output_dir"] / "metrics.txt", "w") as fp:
+        fp.write(str(acc))
+    logger.info("Test Acc %s", acc)
 
 
 if __name__ == "__main__":
+    cli_args = parse_args_llama()
+    pipeline(cli_args)
 
-    pipeline(args)
-
-    torch.cuda.empty_cache()
-    torch.cuda.reset_max_memory_allocated()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_max_memory_allocated()
     gc.collect()

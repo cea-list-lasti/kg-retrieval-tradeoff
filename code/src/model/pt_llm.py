@@ -16,6 +16,20 @@ EOS = '</s>'
 IGNORE_INDEX = -100
 
 
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _build_model_load_kwargs(args):
+    load_kwargs = {"revision": "main"}
+    if torch.cuda.is_available():
+        load_kwargs["max_memory"] = {i: f"{size}GiB" for i, size in enumerate(args.max_memory)}
+        load_kwargs["device_map"] = {"": 0}
+    return load_kwargs
+
+
 class PromptTuningLLM(torch.nn.Module):
 
     def __init__(
@@ -30,12 +44,8 @@ class PromptTuningLLM(torch.nn.Module):
         num_virtual_tokens = args.llm_num_virtual_tokens
 
         print('Loading LLAMA')
-        kwargs = {
-            "max_memory": {0: '80GiB', 1: '80GiB'},
-            "device_map": "auto",
-            "revision": "main",
-        }
-        self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=kwargs["revision"])
+        load_kwargs = _build_model_load_kwargs(args)
+        self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=load_kwargs["revision"])
         self.tokenizer.pad_token_id = 0
         self.tokenizer.padding_side = 'left'
 
@@ -43,10 +53,10 @@ class PromptTuningLLM(torch.nn.Module):
             args.llm_model_path,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
-            **kwargs
+            **load_kwargs
         )
 
-        if args.llm_frozen == 'True':
+        if _as_bool(args.llm_frozen):
             print("Freezing LLAMA!")
             for name, param in model.named_parameters():
                 param.requires_grad = False
@@ -117,7 +127,7 @@ class PromptTuningLLM(torch.nn.Module):
         batch_inputs_embeds = []
         batch_attention_mask = []
         batch_label_input_ids = []
-        prompt_embeds = self.prompt.repeat(batch_size, 1)
+        prompt_embeds = self.prompt
         for i in range(batch_size):
             # Add bos & eos token
             label_input_ids = labels.input_ids[i][:self.max_new_tokens] + eos_tokens.input_ids
@@ -166,7 +176,7 @@ class PromptTuningLLM(torch.nn.Module):
         batch_size = len(samples['id'])
         batch_inputs_embeds = []
         batch_attention_mask = []
-        prompt_embeds = self.prompt.repeat(batch_size, 1)
+        prompt_embeds = self.prompt
         for i in range(batch_size):
             # Add bos & eos token
             input_ids = descriptions.input_ids[i][:self.max_txt_len] + questions.input_ids[i] + eos_user_tokens.input_ids

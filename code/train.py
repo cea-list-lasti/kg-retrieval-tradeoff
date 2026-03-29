@@ -1,8 +1,8 @@
 import os
 import gc
+from pathlib import Path
 from tqdm import tqdm
 import torch
-import json
 from torch.utils.data import Subset
 import pandas as pd
 from torch.utils.data import DataLoader
@@ -17,11 +17,12 @@ from src.utils.collate import collate_fn
 from src.utils.lr_schedule import adjust_learning_rate
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.cuda.set_device(0)  
+if torch.cuda.is_available():
+    torch.cuda.set_device(0)
 
 def train(args):
 
-    path = f'home/project/preprocessed/{args.dataset}'
+    path = Path(args.preprocessed_dir) / args.dataset
 
     # Step 1: Load dataset
     print(args)
@@ -34,15 +35,15 @@ def train(args):
     idx_val = []
     idx_test = []
     for index in idx_split["train"]:
-        if os.path.exists(f'{path}/cached_graphs/{index}.pt') and os.path.exists(f'{path}/cached_desc/{index}.txt'):
+        if (path / "cached_graphs" / f"{index}.pt").exists() and (path / "cached_desc" / f"{index}.txt").exists():
             idx_train.append(index)
 
     for index in idx_split["val"]:
-        if os.path.exists(f'{path}/cached_graphs/{index}.pt') and os.path.exists(f'{path}/cached_desc/{index}.txt'):
+        if (path / "cached_graphs" / f"{index}.pt").exists() and (path / "cached_desc" / f"{index}.txt").exists():
             idx_val.append(index)
 
     for index in idx_split["test"]:
-        if os.path.exists(f'{path}/cached_graphs/{index}.pt') and os.path.exists(f'{path}/cached_desc/{index}.txt'):
+        if (path / "cached_graphs" / f"{index}.pt").exists() and (path / "cached_desc" / f"{index}.txt").exists():
             idx_test.append(index)
 
 
@@ -51,12 +52,13 @@ def train(args):
     val_dataset = Subset(dataset, idx_val)
     test_dataset = Subset(dataset, idx_test)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, pin_memory=True, shuffle=True, collate_fn=collate_fn, num_workers=32)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn, num_workers=32)
-    test_loader = DataLoader(test_dataset, batch_size=args.eval_batch_size, drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn, num_workers=32)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, drop_last=True, pin_memory=True, shuffle=True, collate_fn=collate_fn, num_workers=args.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn, num_workers=args.num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=args.eval_batch_size, drop_last=False, pin_memory=True, shuffle=False, collate_fn=collate_fn, num_workers=args.num_workers)
 
     # Step 3: Build Model (LLM)
-    args.llm_model_path = llama_model_path[args.llm_model_name]
+    if not args.llm_model_path:
+        args.llm_model_path = llama_model_path[args.llm_model_name]
     model = load_model[args.model_name](graph_type=dataset.graph_type, args=args, init_prompt=dataset.prompt)
 
     # Step 4: Set Optimizer
@@ -72,7 +74,8 @@ def train(args):
     num_training_steps = args.num_epochs * len(train_loader)
     progress_bar = tqdm(range(num_training_steps))
     best_val_loss = float('inf')
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     for epoch in range(args.num_epochs):
 
         model.train()
@@ -120,8 +123,10 @@ def train(args):
             print(f'Early stop at epoch {epoch}')
             break
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_max_memory_allocated()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_max_memory_allocated()
 
     # Step 5: Model Evaluation
     os.makedirs(f'{args.output_dir}/{args.dataset}', exist_ok=True)
@@ -131,14 +136,20 @@ def train(args):
     model = _reload_best_model(model, args)
     model.eval()
     progress_bar_test = tqdm(range(len(test_loader)))
-    with open(path, "w") as f:
-        for step, batch in enumerate(test_loader):
-            with torch.no_grad():
-                output = model.inference(batch)
-                df = pd.DataFrame(output)
-                for _, row in df.iterrows():
-                    f.write(json.dumps(dict(row)) + "\n")
-            progress_bar_test.update(1)
+    results = []
+    for step, batch in enumerate(test_loader):
+        with torch.no_grad():
+            output = model.inference(batch)
+            df = pd.DataFrame(output)
+            results.append(df)
+        progress_bar_test.update(1)
+
+    if len(results) > 0:
+        final_df = pd.concat(results, ignore_index=True)
+        final_df.to_csv(path, index=False)
+    else:
+        print("No predictions were produced on the test set. Skipping metric computation.")
+        return
 
     # Step 6: Compute Metrics
     acc = eval_funcs[args.dataset](path)
@@ -150,6 +161,8 @@ if __name__ == "__main__":
     args = parse_args_llama()
 
     train(args)
-    torch.cuda.empty_cache()
-    torch.cuda.reset_max_memory_allocated()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.reset_max_memory_allocated()
     gc.collect()

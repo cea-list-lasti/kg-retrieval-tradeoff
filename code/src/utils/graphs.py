@@ -1,6 +1,5 @@
 
 import re
-import os
 from tqdm import tqdm
 import pandas as pd
 from torch.utils.data import Subset
@@ -12,22 +11,20 @@ from src.config import parse_args_llama
 from src.utils.load import load_parquet
 
 
-alpha = os.environ.get("ALPHA")
-if alpha == None:
-    print("Env variable not defined")
-
-args = parse_args_llama()
-
-dataset_path = f"/home/project/decomp_datasets/{args.dataset}/dataset_chunk_*.parquet"
+def resolve_dataset_path(dataset_path=None):
+    if dataset_path is not None:
+        return dataset_path
+    args = parse_args_llama()
+    return f"{args.decomp_datasets_dir}/{args.dataset}/dataset_chunk_*.parquet"
 
 
 # Collection of useful functions for evaluation, additional results...
 
 
 
-def exact_matching(test_range, path):
+def exact_matching(test_range, path, dataset_path=None):
 
-    dataset = load_parquet(dataset_path)
+    dataset = load_parquet(resolve_dataset_path(dataset_path))
     dataset = Subset(dataset, test_range)
 
     cached_desc = f'{path}/cached_desc'
@@ -111,9 +108,9 @@ def check_density(path):
 
 
 
-def check_size(path, test_range):
+def check_size(path, test_range, dataset_path=None):
 
-    dataset = load_parquet(dataset_path)
+    dataset = load_parquet(resolve_dataset_path(dataset_path))
     dataset = Subset(dataset, test_range)
 
     cached_graphs  =f'{path}/cached_graphs'
@@ -125,5 +122,3 @@ def check_size(path, test_range):
         size = graph.num_nodes
         total_size += size
     print(total_size/999)
-
-

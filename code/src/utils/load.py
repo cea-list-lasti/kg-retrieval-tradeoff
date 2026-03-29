@@ -9,6 +9,8 @@ def load_parquet(path):
         glob.glob(path),
         key=lambda x: int(re.search(r"dataset_chunk_(\d+)\.parquet", x).group(1))
     )
+    if len(files) == 0:
+        raise FileNotFoundError(f"No parquet files found for pattern: {path}")
     # Concatenate into a single Hugging Face dataset
     dataset = load_dataset("parquet", data_files=files)
     dataset = concatenate_datasets([dataset["train"]])
@@ -17,9 +19,4 @@ def load_parquet(path):
 def get_indices(path):
     with open(path) as f:
         indices = [int(line.strip()) for line in f]
-
-    start = min(indices)
-    end = max(indices)
-
-    index_range = range(start, end + 1)
-    return index_range
+    return sorted(indices)

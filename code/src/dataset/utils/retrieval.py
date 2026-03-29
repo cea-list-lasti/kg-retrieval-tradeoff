@@ -6,7 +6,35 @@ import csv
 import os
 
 
-def retrieval_via_pcst_2(graph, q_emb, sq_emb, textual_nodes, textual_edges, topk=3, topk_e=5, cost_e=0.5, alpha=0.5):
+def retrieval_via_pcst_2(
+    graph,
+    q_emb,
+    sq_emb=None,
+    textual_nodes=None,
+    textual_edges=None,
+    topk=3,
+    topk_e=5,
+    cost_e=0.5,
+    alpha=0.5,
+):
+    # Backward compatibility with old call style:
+    # retrieval_via_pcst_2(graph, q_emb, textual_nodes, textual_edges, ...)
+    if textual_edges is None and textual_nodes is not None and not torch.is_tensor(sq_emb):
+        textual_edges = textual_nodes
+        textual_nodes = sq_emb
+        sq_emb = None
+
+    if sq_emb is None:
+        sq_emb = q_emb
+
+    if q_emb.dim() > 1:
+        q_emb = q_emb.squeeze(0)
+    if sq_emb.dim() > 1:
+        sq_emb = sq_emb.squeeze(0)
+
+    if textual_nodes is None or textual_edges is None:
+        raise ValueError("textual_nodes and textual_edges must be provided.")
+
     c = 0.01
     if len(textual_nodes) == 0 or len(textual_edges) == 0:
         desc = textual_nodes.to_csv(index=False) + '\n' + textual_edges.to_csv(index=False, columns=['src', 'edge_attr', 'dst'])
@@ -55,7 +83,7 @@ def retrieval_via_pcst_2(graph, q_emb, sq_emb, textual_nodes, textual_edges, top
     virtual_costs = []
     mapping_n = {}
     mapping_e = {}
-    for i, (src, dst) in enumerate(graph.edge_index.T.numpy()):
+    for i, (src, dst) in enumerate(graph.edge_index.T.cpu().numpy()):
         prize_e = e_prizes_total[i]
         if prize_e <= cost_e:
             mapping_e[len(edges)] = i
@@ -86,8 +114,20 @@ def retrieval_via_pcst_2(graph, q_emb, sq_emb, textual_nodes, textual_edges, top
         virtual_edges = [mapping_n[i] for i in virtual_vertices]
         selected_edges = np.array(selected_edges+virtual_edges)
 
+    if len(selected_edges) == 0:
+        # Keep at least one node to avoid empty graph crashes downstream.
+        selected_nodes = np.array([int(torch.argmax(n_prizes_total).item())])
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_attr = graph.edge_attr[:0]
+        n = textual_nodes.iloc[selected_nodes]
+        e = textual_edges.iloc[:0]
+        desc = n.to_csv(index=False) + '\n' + e.to_csv(index=False, columns=['src', 'edge_attr', 'dst'])
+        x = graph.x[selected_nodes]
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(selected_nodes))
+        return data, desc
+
     edge_index = graph.edge_index[:, selected_edges]
-    selected_nodes = np.unique(np.concatenate([selected_nodes, edge_index[0].numpy(), edge_index[1].numpy()]))
+    selected_nodes = np.unique(np.concatenate([selected_nodes, edge_index[0].cpu().numpy(), edge_index[1].cpu().numpy()]))
 
     n = textual_nodes.iloc[selected_nodes]
     e = textual_edges.iloc[selected_edges]

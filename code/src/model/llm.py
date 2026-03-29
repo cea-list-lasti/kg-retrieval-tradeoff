@@ -15,6 +15,20 @@ EOS = '</s>'
 IGNORE_INDEX = -100
 
 
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _build_model_load_kwargs(args):
+    load_kwargs = {"revision": "main"}
+    if torch.cuda.is_available():
+        load_kwargs["max_memory"] = {i: f"{size}GiB" for i, size in enumerate(args.max_memory)}
+        load_kwargs["device_map"] = {"": 0}
+    return load_kwargs
+
+
 class LLM(torch.nn.Module):
 
     def __init__(
@@ -29,12 +43,8 @@ class LLM(torch.nn.Module):
 
 
         print('Loading LLAMA')
-        kwargs = {
-            "max_memory": {i: f'{size}GiB' for i, size in enumerate(args.max_memory)},
-            "device_map":  {"": 0},
-            "revision": "main",
-        }
-        self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=kwargs["revision"])
+        load_kwargs = _build_model_load_kwargs(args)
+        self.tokenizer = AutoTokenizer.from_pretrained(args.llm_model_path, use_fast=False, revision=load_kwargs["revision"])
         self.tokenizer.pad_token_id = 0
         self.tokenizer.padding_side = 'left'
 
@@ -42,10 +52,10 @@ class LLM(torch.nn.Module):
             args.llm_model_path,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
-            **kwargs
+            **load_kwargs
         )
 
-        if args.llm_frozen == 'True':
+        if _as_bool(args.llm_frozen):
             print("Freezing LLAMA!")
             for name, param in model.named_parameters():
                 param.requires_grad = False
